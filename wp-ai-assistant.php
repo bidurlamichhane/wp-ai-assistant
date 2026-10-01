@@ -3,6 +3,7 @@
  * Plugin Name: WP AI Assistant
  * Description: AI integration for WordPress.
  * Version: 0.2.0
+ * License: GPL-2.0-or-later
  */
 
 // Stop direct access to this file.
