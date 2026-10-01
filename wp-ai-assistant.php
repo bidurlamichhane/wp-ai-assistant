@@ -76,7 +76,7 @@ function wpai_gemini_generate( $prompt, $image = null ) {
 		return new WP_Error( 'no_key', 'GEMINI_API_KEY is not set in wp-config.php.' );
 	}
 
-	$model = 'gemini-3.8-flash'; // Change this if Google retires the name.
+	$model = wpai_get_setting( 'model' ); // Change this if Google retires the name.
 	$url   = 'https://generativelanguage.googleapis.com/v1beta/models/' . $model . ':generateContent';
 
 	// Build the message: an optional image first, then the text instructions.
@@ -171,9 +171,7 @@ function wpai_ajax_excerpt() {
 		wp_send_json_error( 'Write some content first.' );
 	}
 
-	$prompt = "Write a concise excerpt for the blog post below: one or two sentences, "
-		. "under 155 characters, plain text, no quotation marks. "
-		. "Return only the excerpt.\n\nPOST:\n" . $content;
+	$prompt = wpai_get_setting( 'excerpt_prompt' ) . "\n\nPOST:\n" . $content;
 
 	$result = wpai_gemini_generate( $prompt );
 
@@ -258,9 +256,7 @@ function wpai_ajax_alt() {
 		'data' => base64_encode( file_get_contents( $file ) ),
 	);
 
-	$prompt = 'Write alt text for this image for a website. One short sentence, '
-		. 'under 125 characters. Describe what is visible. Do not start with '
-		. '"image of" or "picture of". Plain text only. Return only the alt text.';
+	$prompt = wpai_get_setting( 'alt_prompt' );
 
 	$result = wpai_gemini_generate( $prompt, $image );
 
@@ -272,4 +268,143 @@ function wpai_ajax_alt() {
 	update_post_meta( $id, '_wp_attachment_image_alt', $alt );
 
 	wp_send_json_success( $alt );
+}
+
+
+// ---------- Settings ----------
+
+// Default values, used when a setting is empty.
+function wpai_defaults() {
+	return array(
+		'model'          => 'gemini-3.8-flash',
+		'excerpt_prompt' => 'Write a concise excerpt for the blog post below: one or two sentences, under 155 characters, plain text, no quotation marks. Return only the excerpt.',
+		'alt_prompt'     => 'Write alt text for this image for a website. One short sentence, under 125 characters. Describe what is visible. Do not start with "image of" or "picture of". Plain text only. Return only the alt text.',
+	);
+}
+
+// Get one setting, falling back to the default if it's empty.
+function wpai_get_setting( $key ) {
+	$defaults = wpai_defaults();
+	$options  = get_option( 'wpai_settings', array() );
+
+	if ( ! empty( $options[ $key ] ) ) {
+		return $options[ $key ];
+	}
+	return $defaults[ $key ];
+}
+
+// Add "Settings" under the AI Assistant menu.
+add_action( 'admin_menu', function () {
+	add_submenu_page(
+		'wp-ai-assistant',
+		'AI Assistant Settings',
+		'Settings',
+		'manage_options',
+		'wpai-settings',
+		'wpai_settings_page'
+	);
+}, 11 );
+
+// Tell WordPress about our settings and fields.
+add_action( 'admin_init', function () {
+	register_setting( 'wpai_settings_group', 'wpai_settings', array(
+		'type'              => 'array',
+		'sanitize_callback' => 'wpai_sanitize_settings',
+		'default'           => array(),
+	) );
+
+	add_settings_section( 'wpai_main', 'Gemini settings', '__return_false', 'wpai-settings' );
+
+	add_settings_field( 'wpai_key_status', 'API key', 'wpai_render_key_status', 'wpai-settings', 'wpai_main' );
+
+	add_settings_field( 'wpai_model', 'Model name', 'wpai_render_field', 'wpai-settings', 'wpai_main', array(
+		'key'  => 'model',
+		'type' => 'text',
+		'help' => 'Check Google AI Studio for current model names. Leave empty to use the default.',
+	) );
+
+	add_settings_field( 'wpai_excerpt_prompt', 'Excerpt prompt', 'wpai_render_field', 'wpai-settings', 'wpai_main', array(
+		'key'  => 'excerpt_prompt',
+		'type' => 'textarea',
+		'help' => 'Instructions for the excerpt generator. The post text is added automatically. Leave empty to reset.',
+	) );
+
+	add_settings_field( 'wpai_alt_prompt', 'Alt text prompt', 'wpai_render_field', 'wpai-settings', 'wpai_main', array(
+		'key'  => 'alt_prompt',
+		'type' => 'textarea',
+		'help' => 'Instructions for the alt text generator. The image is sent automatically. Leave empty to reset.',
+	) );
+} );
+
+// Clean whatever was submitted before it's saved.
+function wpai_sanitize_settings( $input ) {
+	$input = is_array( $input ) ? $input : array();
+	$clean = array();
+
+	// Model names only contain letters, numbers, dots, dashes and underscores.
+	$clean['model'] = isset( $input['model'] )
+		? preg_replace( '/[^a-zA-Z0-9._-]/', '', $input['model'] )
+		: '';
+
+	$clean['excerpt_prompt'] = isset( $input['excerpt_prompt'] )
+		? sanitize_textarea_field( $input['excerpt_prompt'] )
+		: '';
+
+	$clean['alt_prompt'] = isset( $input['alt_prompt'] )
+		? sanitize_textarea_field( $input['alt_prompt'] )
+		: '';
+
+	return $clean;
+}
+
+// Draw one text or textarea field.
+function wpai_render_field( $args ) {
+	$value = wpai_get_setting( $args['key'] );
+	$name  = 'wpai_settings[' . $args['key'] . ']';
+
+	if ( 'textarea' === $args['type'] ) {
+		printf(
+			'<textarea name="%s" rows="5" class="large-text">%s</textarea>',
+			esc_attr( $name ),
+			esc_textarea( $value )
+		);
+	} else {
+		printf(
+			'<input type="text" name="%s" value="%s" class="regular-text">',
+			esc_attr( $name ),
+			esc_attr( $value )
+		);
+	}
+
+	if ( ! empty( $args['help'] ) ) {
+		printf( '<p class="description">%s</p>', esc_html( $args['help'] ) );
+	}
+}
+
+// Show whether the key exists, without ever showing the key itself.
+function wpai_render_key_status() {
+	if ( defined( 'GEMINI_API_KEY' ) && GEMINI_API_KEY ) {
+		echo '<span style="color:#00a32a;">&#10003; Found in wp-config.php</span>';
+	} else {
+		echo '<span style="color:#d63638;">&#10007; Not found. Add GEMINI_API_KEY to wp-config.php.</span>';
+	}
+}
+
+// The settings page itself.
+function wpai_settings_page() {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+	?>
+	<div class="wrap">
+		<h1>AI Assistant Settings</h1>
+		<form method="post" action="options.php">
+			<?php
+			settings_fields( 'wpai_settings_group' );
+			do_settings_sections( 'wpai-settings' );
+			submit_button();
+			?>
+		</form>
+	</div>
+	<?php
 }
