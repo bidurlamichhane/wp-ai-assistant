@@ -70,14 +70,26 @@ function wpai_render_page() {
 	<?php
 }
 
-// Send a prompt to Gemini and return the text, or a WP_Error on failure.
-function wpai_gemini_generate( $prompt ) {
+// Send a prompt (and optionally an image) to Gemini. Returns text or a WP_Error.
+function wpai_gemini_generate( $prompt, $image = null ) {
 	if ( ! defined( 'GEMINI_API_KEY' ) || ! GEMINI_API_KEY ) {
 		return new WP_Error( 'no_key', 'GEMINI_API_KEY is not set in wp-config.php.' );
 	}
 
 	$model = 'gemini-3.8-flash'; // Change this if Google retires the name.
 	$url   = 'https://generativelanguage.googleapis.com/v1beta/models/' . $model . ':generateContent';
+
+	// Build the message: an optional image first, then the text instructions.
+	$parts = array();
+	if ( $image ) {
+		$parts[] = array(
+			'inline_data' => array(
+				'mime_type' => $image['mime'],
+				'data'      => $image['data'], // base64-encoded image
+			),
+		);
+	}
+	$parts[] = array( 'text' => $prompt );
 
 	$response = wp_remote_post( $url, array(
 		'timeout' => 60,
@@ -86,13 +98,10 @@ function wpai_gemini_generate( $prompt ) {
 			'x-goog-api-key' => GEMINI_API_KEY,
 		),
 		'body'    => wp_json_encode( array(
-			'contents' => array(
-				array( 'parts' => array( array( 'text' => $prompt ) ) ),
-			),
+			'contents' => array( array( 'parts' => $parts ) ),
 		) ),
 	) );
 
-	// Network-level failure (no connection, timeout).
 	if ( is_wp_error( $response ) ) {
 		return $response;
 	}
@@ -100,7 +109,6 @@ function wpai_gemini_generate( $prompt ) {
 	$code = wp_remote_retrieve_response_code( $response );
 	$data = json_decode( wp_remote_retrieve_body( $response ), true );
 
-	// Gemini replied with an error (bad key, rate limit, wrong model name).
 	if ( 200 !== $code ) {
 		$message = $data['error']['message'] ?? 'Unexpected response (HTTP ' . $code . ').';
 		return new WP_Error( 'gemini_error', $message );
@@ -174,4 +182,94 @@ function wpai_ajax_excerpt() {
 	}
 
 	wp_send_json_success( sanitize_textarea_field( trim( $result ) ) );
+}
+
+
+// 1. Add a "Generate alt text" button to image attachments.
+add_filter( 'attachment_fields_to_edit', function ( $fields, $post ) {
+	if ( ! wp_attachment_is_image( $post->ID ) ) {
+		return $fields;
+	}
+
+	$fields['wpai_alt'] = array(
+		'label' => 'AI alt text',
+		'input' => 'html',
+		'html'  => '<button type="button" class="button wpai-alt" data-id="' . esc_attr( $post->ID ) . '">Generate alt text</button>'
+			. '<span class="wpai-alt-status"></span>',
+	);
+
+	return $fields;
+}, 10, 2 );
+
+// 2. Load the script on the media library and editor screens
+//    (the media popup can open on any of them).
+add_action( 'admin_enqueue_scripts', function ( $hook ) {
+	if ( ! in_array( $hook, array( 'upload.php', 'post.php', 'post-new.php' ), true ) ) {
+		return;
+	}
+
+	wp_enqueue_script( 'wpai-alt', plugin_dir_url( __FILE__ ) . 'assets/alt.js', array(), '0.4.0', true );
+
+	wp_localize_script( 'wpai-alt', 'wpaiAlt', array(
+		'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+		'nonce'   => wp_create_nonce( 'wpai_alt' ),
+	) );
+} );
+
+// 3. Handle the request: read the image, ask Gemini, save the alt text.
+add_action( 'wp_ajax_wpai_alt', 'wpai_ajax_alt' );
+
+function wpai_ajax_alt() {
+	check_ajax_referer( 'wpai_alt', 'nonce' );
+
+	$id = isset( $_POST['id'] ) ? absint( $_POST['id'] ) : 0;
+
+	if ( ! $id || ! current_user_can( 'edit_post', $id ) ) {
+		wp_send_json_error( 'You are not allowed to do that.', 403 );
+	}
+	if ( ! wp_attachment_is_image( $id ) ) {
+		wp_send_json_error( 'That file is not an image.' );
+	}
+
+	// Prefer the "large" size: it's smaller and plenty for describing a photo.
+	$file  = get_attached_file( $id );
+	$large = image_get_intermediate_size( $id, 'large' );
+	if ( $large && ! empty( $large['path'] ) ) {
+		$candidate = path_join( wp_get_upload_dir()['basedir'], $large['path'] );
+		if ( file_exists( $candidate ) ) {
+			$file = $candidate;
+		}
+	}
+
+	if ( ! $file || ! file_exists( $file ) ) {
+		wp_send_json_error( 'Image file not found.' );
+	}
+	if ( filesize( $file ) > 4 * MB_IN_BYTES ) {
+		wp_send_json_error( 'Image is too large (over 4 MB).' );
+	}
+
+	$mime = wp_check_filetype( $file )['type'];
+	if ( ! in_array( $mime, array( 'image/jpeg', 'image/png', 'image/webp', 'image/gif' ), true ) ) {
+		wp_send_json_error( 'Unsupported image type.' );
+	}
+
+	$image = array(
+		'mime' => $mime,
+		'data' => base64_encode( file_get_contents( $file ) ),
+	);
+
+	$prompt = 'Write alt text for this image for a website. One short sentence, '
+		. 'under 125 characters. Describe what is visible. Do not start with '
+		. '"image of" or "picture of". Plain text only. Return only the alt text.';
+
+	$result = wpai_gemini_generate( $prompt, $image );
+
+	if ( is_wp_error( $result ) ) {
+		wp_send_json_error( $result->get_error_message() );
+	}
+
+	$alt = sanitize_text_field( trim( $result ) );
+	update_post_meta( $id, '_wp_attachment_image_alt', $alt );
+
+	wp_send_json_success( $alt );
 }
